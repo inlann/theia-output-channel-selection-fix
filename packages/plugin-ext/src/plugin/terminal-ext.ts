@@ -14,14 +14,15 @@
 // SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
 // *****************************************************************************
 import { UUID } from '@theia/core/shared/@phosphor/coreutils';
-import { Terminal, TerminalOptions, PseudoTerminalOptions, ExtensionTerminalOptions } from '@theia/plugin';
+import { Terminal, TerminalOptions, PseudoTerminalOptions, ExtensionTerminalOptions, TerminalState } from '@theia/plugin';
 import { TerminalServiceExt, TerminalServiceMain, PLUGIN_RPC_CONTEXT } from '../common/plugin-api-rpc';
 import { RPCProtocol } from '../common/rpc-protocol';
 import { Event, Emitter } from '@theia/core/lib/common/event';
 import { Deferred } from '@theia/core/lib/common/promise-util';
 import * as theia from '@theia/plugin';
-import { EnvironmentVariableMutatorType } from './types-impl';
+import { Disposable, EnvironmentVariableMutatorType } from './types-impl';
 import { SerializableEnvironmentVariableCollection } from '@theia/terminal/lib/common/base-terminal-protocol';
+import { ProvidedTerminalLink } from '../common/plugin-api-rpc-model';
 
 /**
  * Provides high level terminal plugin api to use in the Theia plugins.
@@ -35,6 +36,9 @@ export class TerminalServiceExtImpl implements TerminalServiceExt {
 
     private readonly _pseudoTerminals = new Map<string, PseudoTerminal>();
 
+    private static nextTerminalLinkProviderId = 0;
+    private readonly terminalLinkProviders = new Map<string, theia.TerminalLinkProvider>();
+
     private readonly onDidCloseTerminalEmitter = new Emitter<Terminal>();
     readonly onDidCloseTerminal: theia.Event<Terminal> = this.onDidCloseTerminalEmitter.event;
 
@@ -43,6 +47,9 @@ export class TerminalServiceExtImpl implements TerminalServiceExt {
 
     private readonly onDidChangeActiveTerminalEmitter = new Emitter<Terminal | undefined>();
     readonly onDidChangeActiveTerminal: theia.Event<Terminal | undefined> = this.onDidChangeActiveTerminalEmitter.event;
+
+    private readonly onDidChangeTerminalStateEmitter = new Emitter<Terminal>();
+    readonly onDidChangeTerminalState: theia.Event<Terminal> = this.onDidChangeTerminalStateEmitter.event;
 
     protected environmentVariableCollections: Map<string, EnvironmentVariableCollection> = new Map();
 
@@ -107,6 +114,17 @@ export class TerminalServiceExtImpl implements TerminalServiceExt {
         terminal.emitOnInput(data);
     }
 
+    $terminalStateChanged(id: string): void {
+        const terminal = this._terminals.get(id);
+        if (!terminal) {
+            return;
+        }
+        if (!terminal.state.isInteractedWith) {
+            terminal.state = { isInteractedWith: true };
+            this.onDidChangeTerminalStateEmitter.fire(terminal);
+        }
+    }
+
     $terminalSizeChanged(id: string, clos: number, rows: number): void {
         const terminal = this._pseudoTerminals.get(id);
         if (!terminal) {
@@ -165,6 +183,38 @@ export class TerminalServiceExtImpl implements TerminalServiceExt {
     $currentTerminalChanged(id: string | undefined): void {
         this.activeTerminalId = id;
         this.onDidChangeActiveTerminalEmitter.fire(this.activeTerminal);
+    }
+
+    registerTerminalLinkProvider(provider: theia.TerminalLinkProvider): theia.Disposable {
+        const providerId = (TerminalServiceExtImpl.nextTerminalLinkProviderId++).toString();
+        this.terminalLinkProviders.set(providerId, provider);
+        this.proxy.$registerTerminalLinkProvider(providerId);
+        return Disposable.create(() => {
+            this.proxy.$unregisterTerminalLinkProvider(providerId);
+            this.terminalLinkProviders.delete(providerId);
+        });
+    }
+
+    async $provideTerminalLinks(line: string, terminalId: string, token: theia.CancellationToken): Promise<ProvidedTerminalLink[]> {
+        const links: ProvidedTerminalLink[] = [];
+        const terminal = this._terminals.get(terminalId);
+        if (terminal) {
+            for (const [providerId, provider] of this.terminalLinkProviders) {
+                const providedLinks = await provider.provideTerminalLinks({ line, terminal }, token);
+                if (providedLinks) {
+                    links.push(...providedLinks.map(link => ({ ...link, providerId })));
+                }
+            }
+        }
+        return links;
+    }
+
+    async $handleTerminalLink(link: ProvidedTerminalLink): Promise<void> {
+        const provider = this.terminalLinkProviders.get(link.providerId);
+        if (!provider) {
+            throw Error('Terminal link provider not found');
+        }
+        await provider.handleTerminalLink(link);
     }
 
     /*---------------------------------------------------------------------------------------------
@@ -286,6 +336,8 @@ export class TerminalExtImpl implements Terminal {
     }
 
     readonly creationOptions: Readonly<TerminalOptions | ExtensionTerminalOptions>;
+
+    state: TerminalState = { isInteractedWith: false };
 
     constructor(private readonly proxy: TerminalServiceMain, private readonly options: theia.TerminalOptions | theia.ExtensionTerminalOptions) {
         this.creationOptions = this.options;
